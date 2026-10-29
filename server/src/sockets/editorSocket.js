@@ -11,69 +11,95 @@ import Room from '../models/Room.js';
 
 const saveTimers = new Map(); //roomid->pending timer
 
-//save the latest code to db
-const persistRoomCode = async (roomId, code, language) => {
-  try {
-    // findOneAndUpdate with timestamps: true auto-updates updatedAt
-    await Room.findOneAndUpdate(
-      { roomId },
-      { code, language },
-      { upsert: true, // if no matching, create one
-         new: true } //return the updated doc rather than the previous one
-    ); //other fields remain same
-    console.log(`[DB Persisted] Room ${roomId} autosaved at ${new Date().toISOString()}`);
-  } catch (err) {
-    console.error(`[DB Error] Autosave failed for ${roomId}:`, err);
-  }
-};
+// roomId -> Value: latest code string
+// for new joiner, so that he receives the latest code, not from the db but from this buffer
+const activeCodeBuffer = new Map();
 
 //registers editor's Socket.IO event handlers
 export const registerEditorHandlers = (io, socket) => { //io is the server instance and the socket is the connection belonging to one particular client
     //whenever client connects, these handlers...like in iane socket setup...io.on(connection,...registereditrohandlers)
 
-  // event1-> Join Room & Fetch Complete State.....on frontent....socket.emit('room:join',{roomid,username,title})
-  socket.on('room:join', async ({ roomId, username, title }) => {
-    socket.join(roomId);
+  // event1-> Join Room & Fetch Complete State.....on frontend....socket.emit('room:join',{roomid,username,title})
 
-    // Find or create the room with metadata
-    let room = await Room.findOne({ roomId });
+  const currentUser=socket.data.user; // username from handshake
+  socket.on('room:join', async ({ roomId,title }) => {
+   try {
+      if (!roomId) {
+        return socket.emit('error', { message: 'Room ID is required' });
+      }
+    // Find or create the room with metadata 
+    let room = await Room.findOne({ roomId }).populate('host',         'username email role');
     if (!room) {
       room = await Room.create({
         roomId,
         title: title || 'Untitled Doubt Session',
-        createdBy: username || 'Anonymous Mentor',
+        host: currentUser.id,
+        code: '// Welcome to CodeMate\n',
       });
+      await room.populate('host', 'username email role');
     }
+    socket.join(roomId);
+
+    // Serve buffered in-memory code if an edit is pending, otherwise use MongoDB state
+      const initialCode = activeCodeBuffer.has(roomId) ? activeCodeBuffer.get(roomId) : room.code;
 
     // Send complete session state to the joining client..not to everyone
     socket.emit('room:initial-state', {
       roomId: room.roomId,
       title: room.title,
-      createdBy: room.createdBy,
       recordingUrl: room.recordingUrl,
       updatedAt: room.updatedAt,
       language: room.language,
-      code: room.code,
+      code: initialCode,
+      host: room.host,
+      currentUser: {
+          id: currentUser.id,
+          role: currentUser.role,
+        },
     });
 
     // Notify peers in the room
     socket.to(roomId).emit('room:user-joined', {
-      userId: socket.id,
-      username: username || 'Anonymous Peer',
+      userId: currentUser.id,
+      role: currentUser.role,
     });
+    console.log(`[Socket] User ${currentUser.id} (${currentUser.role}) joined room: ${roomId}`);
+  } catch(error){
+    console.error('[Socket Join Error]:', error);
+    socket.emit('error', { message: 'Failed to join room' });
+  }
   });
 
   // event2-> Real-Time Code Sync with Debounce
   socket.on('editor:code-change', ({ roomId, code, language }) => {
-    socket.to(roomId).emit('editor:code-update', { code }); //isko chodke sabko
+    if (!roomId || typeof code !== 'string') return;
+
+    // Buffer latest in-memory code for immediate consistency
+    activeCodeBuffer.set(roomId, code);
+
+    socket.to(roomId).emit('editor:code-update', { code,language }); //isko chodke sabko
 
     if (saveTimers.has(roomId)) {
       clearTimeout(saveTimers.get(roomId));
     }
 
-    const timer = setTimeout(() => {
-      persistRoomCode(roomId, code, language);
-      saveTimers.delete(roomId);
+    const timer = setTimeout(async() => {
+      try{
+        const latestCode=activeCodeBuffer.get(roomId);
+        //why fetching from buffer and not from closure variable code bcz closures capture the value at the exact momnet setTimeout is declared
+        await Room.findOneAndUpdate(
+          {roomId},
+          {
+            code:latestCode,...(language && { language }) // if language is undefined, then this expression evaluates to false and nohting added to payload
+            //Benefit: It prevents overwriting the room's existing language in MongoDB with undefined when an editor edit event only sends character changes.
+          },
+          {new:true} // return updated doc
+        );
+        console.log(`[DB Auto-Save] Persisted snapshot for room: ${roomId}`);
+        saveTimers.delete(roomId);
+      } catch (err) {
+        console.error(`[DB Auto-Save Error] Room ${roomId}:`, err);
+      }
     }, 3000);
 
     saveTimers.set(roomId, timer); //so that next code-hange event can cancel it
@@ -81,8 +107,40 @@ export const registerEditorHandlers = (io, socket) => { //io is the server insta
 
   // 3. Room Title Rename Sync
   socket.on('room:update-title', async ({ roomId, title }) => {
-    socket.to(roomId).emit('room:title-updated', { title });
-    await Room.updateOne({ roomId }, { title });
+    try {
+      const room = await Room.findOne({ roomId });
+      if (!room) return socket.emit('error', { message: 'Room not found' });
+
+      // RBAC check
+      const hostId = room.host._id ? room.host._id.toString() : room.host.toString();
+      const isHost = hostId === currentUser.id;
+      const isMentor = currentUser.role === 'mentor';
+
+      if (!isHost && !isMentor) {
+        return socket.emit('error', {
+          message: 'Permission denied: Only the host or a mentor can update room details.',
+        });
+      }
+
+      room.title = title;
+      await room.save();
+
+      io.in(roomId).emit('room:title-updated', { title });
+    } catch (error) {
+      socket.emit('error', { message: 'Failed to update title' });
+    }
+  });
+
+  // 4. Disconnect Handler
+  socket.on('disconnecting', () => {
+    for (const roomId of socket.rooms) {
+      if (roomId !== socket.id) {
+        socket.to(roomId).emit('room:user-left', {
+          userId: currentUser.id,
+        });
+      }
+    }
+    console.log(`[Socket] Disconnected: ${currentUser.id}`);
   });
 
 //   // 4. Session Recording Complete Event
